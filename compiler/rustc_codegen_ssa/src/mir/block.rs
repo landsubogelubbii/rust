@@ -1140,19 +1140,76 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             (args, None)
         };
 
+        // Special logic for tail calls with `PassMode::Indirect { on_stack: false, .. }` arguments.
+        //
+        // Normally an indirect argument with `on_stack: false` would be passed as a pointer into
+        // the caller's stack frame. For tail calls, that would be unsound, because the caller's
+        // stack frame is overwritten by the callee's stack frame.
+        //
+        // Therefore we store the argument for the callee in the corresponding caller's slot.
+        // Because guaranteed tail calls demand that the caller's signature matches the callee's,
+        // the corresponding slot has the correct type.
+        //
+        // To handle cases like the one below, the tail call arguments must first be copied to a
+        // temporary, and only then copied to the caller's argument slots.
+        //
+        // ```
+        // // A struct big enough that it is not passed via registers.
+        // pub struct Big([u64; 4]);
+        //
+        // fn swapper(a: Big, b: Big) -> (Big, Big) {
+        //     become swapper_helper(b, a);
+        // }
+        // ```
+        let mut caller_indirect_arg_places = Vec::new();
+        if kind == CallKind::Tail {
+            let mut temporaries = vec![None; first_args.len()];
+            caller_indirect_arg_places = vec![None; first_args.len()];
+
+            // First copy the arguments of this call to temporary stack allocations.
+            for (i, arg) in first_args.iter().enumerate() {
+                if !matches!(fn_abi.args[i].mode, PassMode::Indirect { on_stack: false, .. }) {
+                    continue;
+                }
+
+                let mut op = self.codegen_operand(bx, &arg.node);
+
+                let tmp = PlaceRef::alloca(bx, op.layout);
+                bx.lifetime_start(tmp.val.llval, tmp.layout.size);
+                op.store_with_annotation(bx, tmp);
+
+                op.val = Ref(tmp.val);
+                temporaries[i] = Some(tmp);
+            }
+
+            // Then actually copy them into the corresponding argument place of our caller.
+            for (i, opt_tmp) in temporaries.into_iter().enumerate() {
+                let Some(tmp) = opt_tmp else { continue };
+
+                let local = self.mir.args_iter().nth(i).unwrap();
+
+                match &self.locals[local] {
+                    LocalRef::Place(arg) => {
+                        caller_indirect_arg_places[i] = Some(Ref(arg.val));
+                        bx.typed_place_copy(arg.val, tmp.val, fn_abi.args[i].layout);
+                    }
+                    LocalRef::Operand(arg) => {
+                        caller_indirect_arg_places[i] = Some(arg.val);
+                        arg.store_with_annotation(bx, tmp);
+                    }
+                    LocalRef::UnsizedPlace(_) => bug!("unsized types are not supported"),
+                    LocalRef::PendingOperand => bug!("argument local should not be pending"),
+                };
+
+                bx.lifetime_end(tmp.val.llval, tmp.layout.size);
+            }
+        }
+
         // When generating arguments we sometimes introduce temporary allocations with lifetime
         // that extend for the duration of a call. Keep track of those allocations and their sizes
         // to generate `lifetime_end` when the call returns.
         let mut lifetime_ends_after_call: Vec<(Bx::Value, Size)> = Vec::new();
         'make_args: for (i, arg) in first_args.iter().enumerate() {
-            if kind == CallKind::Tail && matches!(fn_abi.args[i].mode, PassMode::Indirect { .. }) {
-                // FIXME: https://github.com/rust-lang/rust/pull/144232#discussion_r2218543841
-                span_bug!(
-                    fn_span,
-                    "arguments using PassMode::Indirect are currently not supported for tail calls"
-                );
-            }
-
             let mut op = self.codegen_operand(bx, &arg.node);
 
             if let (0, Some(ty::InstanceKind::Virtual(_, idx))) = (i, instance.map(|i| i.def)) {
@@ -1203,18 +1260,47 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 }
             }
 
-            // The callee needs to own the argument memory if we pass it
-            // by-ref, so make a local copy of non-immediate constants.
-            match (&arg.node, op.val) {
-                (&mir::Operand::Copy(_), Ref(PlaceValue { llextra: None, .. }))
-                | (&mir::Operand::Constant(_), Ref(PlaceValue { llextra: None, .. })) => {
-                    let tmp = PlaceRef::alloca(bx, op.layout);
-                    bx.lifetime_start(tmp.val.llval, tmp.layout.size);
-                    op.store_with_annotation(bx, tmp);
-                    op.val = Ref(tmp.val);
-                    lifetime_ends_after_call.push((tmp.val.llval, tmp.layout.size));
+            match kind {
+                CallKind::Tail => {
+                    match fn_abi.args[i].mode {
+                        PassMode::Indirect { on_stack: false, .. } => {
+                            let Some(dst_val) = caller_indirect_arg_places[i] else {
+                                span_bug!(fn_span, "missing caller place for tail call arg {i}");
+                            };
+
+                            // The argument has been stored in the caller's argument place above.
+                            // Now forward that place to the callee.
+                            op.val = dst_val;
+                        }
+                        PassMode::Indirect { on_stack: true, .. } => {
+                            // FIXME: some LLVM backends (notably x86) do not correctly pass byval
+                            // arguments to tail calls (as of LLVM 21). See also:
+                            //
+                            // - https://github.com/rust-lang/rust/pull/144232#discussion_r2218543841
+                            // - https://github.com/rust-lang/rust/issues/144855
+                            span_bug!(
+                                fn_span,
+                                "arguments using PassMode::Indirect {{ on_stack: true, .. }} are currently not supported for tail calls"
+                            )
+                        }
+                        _ => (),
+                    }
                 }
-                _ => {}
+                CallKind::Normal => {
+                    // The callee needs to own the argument memory if we pass it
+                    // by-ref, so make a local copy of non-immediate constants.
+                    match (&arg.node, op.val) {
+                        (&mir::Operand::Copy(_), Ref(PlaceValue { llextra: None, .. }))
+                        | (&mir::Operand::Constant(_), Ref(PlaceValue { llextra: None, .. })) => {
+                            let tmp = PlaceRef::alloca(bx, op.layout);
+                            bx.lifetime_start(tmp.val.llval, tmp.layout.size);
+                            op.store_with_annotation(bx, tmp);
+                            op.val = Ref(tmp.val);
+                            lifetime_ends_after_call.push((tmp.val.llval, tmp.layout.size));
+                        }
+                        _ => {}
+                    }
+                }
             }
 
             self.codegen_argument(
